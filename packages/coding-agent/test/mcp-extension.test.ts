@@ -11,6 +11,7 @@ import {
 	McpAuthRequiredError,
 	McpHttpError,
 	McpSessionExpiredError,
+	MODERN_PROTOCOL_VERSION,
 } from "@earendil-works/pi-mcp";
 import { createInMemoryTransportPair, type InMemoryTransport } from "@earendil-works/pi-mcp/testing";
 import { afterEach, describe, expect, it } from "vitest";
@@ -144,6 +145,25 @@ describe("MCP config", () => {
 		const { servers, errors } = loadMcpConfig({ ...paths, projectTrusted: false });
 		expect(servers.map((server) => server.name)).toEqual(["work-files"]);
 		expect(errors).toEqual([expect.stringContaining('server "work_files" conflicts with "work-files"')]);
+	});
+
+	it("validates explicit protocol versions", () => {
+		const paths = setup(
+			{
+				mcpServers: {
+					modern: { url: "https://example.com/mcp", protocolVersion: MODERN_PROTOCOL_VERSION },
+					legacy: { command: "x", protocolVersion: LATEST_PROTOCOL_VERSION },
+					invalid: { command: "x", protocolVersion: "future" },
+				},
+			},
+			{},
+		);
+		const { servers, errors } = loadMcpConfig({ ...paths, projectTrusted: false });
+		expect(servers.map((server) => [server.name, server.config.protocolVersion])).toEqual([
+			["modern", MODERN_PROTOCOL_VERSION],
+			["legacy", LATEST_PROTOCOL_VERSION],
+		]);
+		expect(errors).toEqual([expect.stringContaining('server "invalid": protocolVersion must be one of')]);
 	});
 
 	it("validates exposure and reads autoEnableCodemode with project precedence", () => {
@@ -455,34 +475,53 @@ describe("MCP connections", () => {
 
 	/** In-memory server that answers initialize, tools/list, and tools/call with "ok". */
 	function createTransport(
-		options: { expireFirstCall?: boolean; methods?: string[]; noTools?: boolean; resources?: boolean } = {},
+		options: {
+			expireFirstCall?: boolean;
+			methods?: string[];
+			modern?: boolean;
+			noTools?: boolean;
+			resources?: boolean;
+		} = {},
 	) {
 		const pair = createInMemoryTransportPair();
 		servers.push(pair.server);
 		pair.server.onMessage((message) => {
 			if (!("id" in message) || !("method" in message)) return;
 			options.methods?.push(message.method);
+			const capabilities = {
+				...(options.noTools ? { prompts: {} } : { tools: {} }),
+				...(options.resources ? { resources: {} } : {}),
+			};
 			const response: JsonRpcMessage =
-				message.method === "initialize"
+				message.method === "server/discover" && options.modern
 					? {
 							jsonrpc: "2.0",
 							id: message.id,
 							result: {
-								protocolVersion: LATEST_PROTOCOL_VERSION,
-								capabilities: {
-									...(options.noTools ? { prompts: {} } : { tools: {} }),
-									...(options.resources ? { resources: {} } : {}),
-								},
-								serverInfo: { name: "fake", version: "1.0.0" },
+								resultType: "complete",
+								supportedVersions: [MODERN_PROTOCOL_VERSION],
+								capabilities,
+								ttlMs: 0,
+								cacheScope: "private",
 							},
 						}
-					: message.method === "tools/list"
-						? options.noTools
-							? { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } }
-							: { jsonrpc: "2.0", id: message.id, result: { tools: [] } }
-						: message.method === "resources/read"
-							? { jsonrpc: "2.0", id: message.id, result: { contents: [{ uri: "docs://a", text: "ok" }] } }
-							: { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "ok" }] } };
+					: message.method === "initialize"
+						? {
+								jsonrpc: "2.0",
+								id: message.id,
+								result: {
+									protocolVersion: LATEST_PROTOCOL_VERSION,
+									capabilities,
+									serverInfo: { name: "fake", version: "1.0.0" },
+								},
+							}
+						: message.method === "tools/list"
+							? options.noTools
+								? { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } }
+								: { jsonrpc: "2.0", id: message.id, result: { tools: [] } }
+							: message.method === "resources/read"
+								? { jsonrpc: "2.0", id: message.id, result: { contents: [{ uri: "docs://a", text: "ok" }] } }
+								: { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "ok" }] } };
 			queueMicrotask(() => void pair.server.send(response));
 		});
 		void pair.server.start();
@@ -571,6 +610,29 @@ for await (const line of createInterface({ input: process.stdin })) {
 			}
 		},
 	);
+
+	it("uses modern discovery only for servers that explicitly select it", async () => {
+		const modernMethods: string[] = [];
+		const modern = connect(
+			{
+				name: "modern",
+				config: { command: "unused", protocolVersion: MODERN_PROTOCOL_VERSION },
+				source: "test",
+			},
+			[() => createTransport({ modern: true, methods: modernMethods })],
+		);
+		await modern.connection.getClient();
+		expect(modernMethods).toEqual(["server/discover", "tools/list"]);
+		await modern.connection.close();
+
+		const legacyMethods: string[] = [];
+		const legacy = connect({ name: "legacy", config: { command: "unused" }, source: "test" }, [
+			() => createTransport({ methods: legacyMethods }),
+		]);
+		await legacy.connection.getClient();
+		expect(legacyMethods).toEqual(["initialize", "tools/list"]);
+		await legacy.connection.close();
+	});
 
 	it("connects to servers without the tools capability without listing tools", async () => {
 		const methods: string[] = [];

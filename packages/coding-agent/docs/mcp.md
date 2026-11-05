@@ -65,6 +65,7 @@ HTTP servers use `url`, `headers`, and `oauth` (see [Authenticate with OAuth](#a
 
 Both server types support:
 
+- `protocolVersion`: require a specific protocol version. Use `"2026-07-28"` for modern stateless servers; without it, Pi uses the legacy `2025-11-25` handshake.
 - `timeout`: per-request timeout in seconds (default 60). Progress notifications reset it.
 - `enabled: false`: keep the entry without connecting to it.
 - `exposure` and `toolExposure`: control how tools reach the model (see [Control tool exposure](#control-tool-exposure)).

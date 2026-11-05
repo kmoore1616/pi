@@ -11,6 +11,8 @@ import {
 	type McpHttpServerConfig as McpHttpServerFields,
 	type McpOAuthConfig as McpOAuthFields,
 	type McpStdioServerConfig as McpStdioServerFields,
+	SUPPORTED_PROTOCOL_VERSIONS,
+	type SupportedProtocolVersion,
 	validateMcpServerConfig as validateMcpServerFields,
 } from "@earendil-works/pi-mcp";
 
@@ -70,6 +72,8 @@ const MCP_EXPOSURE_ALIASES: Readonly<Record<string, McpExposure>> = { "codemode-
  * and `timeout` are shared fields, declared again for pi's documentation.
  */
 interface McpServerConfigBase {
+	/** Protocol version to require. Defaults to the latest handshake-era version. */
+	protocolVersion?: SupportedProtocolVersion;
 	/** Default: `codemode`. */
 	exposure?: McpExposure;
 	/**
@@ -177,6 +181,17 @@ export function getMcpToolExposure(config: McpServerConfig, toolName: string): M
 	return config.exposure ?? "codemode";
 }
 
+/** Checks an explicitly selected protocol version. Returns an error message. */
+function checkProtocolVersion(value: unknown): string | undefined {
+	if (
+		value === undefined ||
+		(typeof value === "string" && (SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(value))
+	) {
+		return undefined;
+	}
+	return `protocolVersion must be one of ${SUPPORTED_PROTOCOL_VERSIONS.map((version) => `"${version}"`).join(", ")}`;
+}
+
 /** Checks `exposure` and `toolExposure`, after aliases were resolved. Returns an error message. */
 function checkExposures(entry: Record<string, unknown>): string | undefined {
 	const { exposure, toolExposure } = entry;
@@ -219,6 +234,7 @@ export function validateMcpServerConfig(name: string, raw: unknown): McpServerCo
 	});
 	if (result.kind === "invalid") return result.error;
 	const error =
+		checkProtocolVersion(result.config.protocolVersion) ??
 		checkExposures(result.config) ??
 		(result.kind === "http" ? checkAuth(result.config.auth, result.config.url) : undefined);
 	if (error) return `server "${name}": ${error}`;

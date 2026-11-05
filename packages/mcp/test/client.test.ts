@@ -7,6 +7,7 @@ import {
 	McpClient,
 	McpError,
 	McpTimeoutError,
+	MODERN_PROTOCOL_VERSION,
 } from "../src/index.ts";
 import { createInMemoryTransportPair, type InMemoryTransport } from "../src/testing/index.ts";
 
@@ -89,6 +90,65 @@ describe("McpClient", () => {
 			{ jsonrpc: "2.0", method: "notifications/initialized" },
 		]);
 		await client.close();
+	});
+
+	it("uses discovery and per-request metadata for the modern protocol", async () => {
+		const { clientTransport, server } = await createServer();
+		server.setHandler("server/discover", () => ({
+			resultType: "complete",
+			supportedVersions: [MODERN_PROTOCOL_VERSION],
+			capabilities: { tools: {} },
+			instructions: "Use modern tools.",
+			ttlMs: 0,
+			cacheScope: "private",
+			_meta: { "io.modelcontextprotocol/serverInfo": { name: "modern-server", version: "2.0.0" } },
+		}));
+		server.setHandler("tools/list", () => ({
+			resultType: "complete",
+			tools: [],
+			ttlMs: 0,
+			cacheScope: "private",
+		}));
+		const client = new McpClient({
+			name: "modern-client",
+			version: "3.0.0",
+			protocolVersion: MODERN_PROTOCOL_VERSION,
+		});
+		await client.connect(clientTransport);
+		expect(client.protocolVersion).toBe(MODERN_PROTOCOL_VERSION);
+		expect(client.serverInfo).toEqual({ name: "modern-server", version: "2.0.0" });
+		expect(client.instructions).toBe("Use modern tools.");
+		expect(await client.listTools()).toEqual([]);
+		const metadata = {
+			"io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+			"io.modelcontextprotocol/clientInfo": { name: "modern-client", version: "3.0.0" },
+			"io.modelcontextprotocol/clientCapabilities": {},
+		};
+		expect(server.messages).toEqual([
+			{ jsonrpc: "2.0", id: 1, method: "server/discover", params: { _meta: metadata } },
+			{ jsonrpc: "2.0", id: 2, method: "tools/list", params: { _meta: metadata } },
+		]);
+		await client.close();
+	});
+
+	it("rejects modern discovery without the requested protocol version", async () => {
+		const { clientTransport, server } = await createServer();
+		server.setHandler("server/discover", () => ({
+			resultType: "complete",
+			supportedVersions: [LATEST_PROTOCOL_VERSION],
+			capabilities: {},
+			ttlMs: 0,
+			cacheScope: "private",
+		}));
+		const client = new McpClient({
+			name: "modern-client",
+			version: "1.0.0",
+			protocolVersion: MODERN_PROTOCOL_VERSION,
+		});
+		await expect(client.connect(clientTransport)).rejects.toThrow(
+			`does not support protocol version ${MODERN_PROTOCOL_VERSION}`,
+		);
+		expect(client.connectionState).toBe("closed");
 	});
 
 	it("paginates tools and preserves protocol tool definitions", async () => {
