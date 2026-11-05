@@ -7,6 +7,7 @@ import {
 	type McpFetch,
 	McpHttpError,
 	McpSessionExpiredError,
+	MODERN_PROTOCOL_VERSION,
 	StreamableHttpTransport,
 } from "../src/index.ts";
 import { consumeSseStream, type SseEvent } from "../src/transports/streamable-http.ts";
@@ -195,8 +196,90 @@ describe("StreamableHttpTransport", () => {
 		const listRequest = requests.find((entry) => entry.message?.method === "tools/list");
 		expect(listRequest?.headers["mcp-session-id"]).toBe("session-1");
 		expect(listRequest?.headers["mcp-protocol-version"]).toBe(LATEST_PROTOCOL_VERSION);
+		expect(listRequest?.headers["mcp-method"]).toBeUndefined();
+		expect(listRequest?.headers["mcp-name"]).toBeUndefined();
 		expect(requests.some((entry) => entry.method === "GET")).toBe(true);
 		expect(requests.some((entry) => entry.method === "DELETE")).toBe(true);
+	});
+
+	it("sends modern metadata and routing headers through OAuth recovery", async () => {
+		let token: string | undefined;
+		let recoveries = 0;
+		const { url, requests } = await startServer(async (request, response, requests) => {
+			const message = JSON.parse(await readBody(request)) as Record<string, unknown>;
+			if (request.headers.authorization !== "Bearer modern-token") {
+				response.writeHead(401, { "www-authenticate": "Bearer" }).end();
+				return;
+			}
+			requests.push({ method: request.method ?? "", headers: request.headers, message });
+			const method = message.method;
+			const result =
+				method === "server/discover"
+					? {
+							resultType: "complete",
+							supportedVersions: [MODERN_PROTOCOL_VERSION],
+							capabilities: { tools: {}, resources: {}, prompts: {} },
+							ttlMs: 0,
+							cacheScope: "private",
+						}
+					: method === "resources/read"
+						? {
+								resultType: "complete",
+								contents: [{ uri: "docs://guide", text: "ok" }],
+								ttlMs: 0,
+								cacheScope: "private",
+							}
+						: { resultType: "complete", content: [], ttlMs: 0, cacheScope: "private" };
+			response.writeHead(200, { "content-type": "application/json" });
+			response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+		});
+		const client = new McpClient({
+			name: "http-test",
+			version: "1.0.0",
+			protocolVersion: MODERN_PROTOCOL_VERSION,
+		});
+		await client.connect(
+			new StreamableHttpTransport({
+				url,
+				openGetStream: false,
+				authProvider: {
+					token: async () => token,
+					onUnauthorized: async () => {
+						recoveries++;
+						token = "modern-token";
+					},
+				},
+			}),
+		);
+		await client.callTool("töol");
+		await client.request("prompts/get", { name: "review" });
+		await client.readResource("docs://guide");
+		await client.close();
+
+		const byMethod = new Map<string, RecordedRequest>();
+		for (const entry of requests) {
+			const method = entry.message?.method;
+			if (typeof method === "string") byMethod.set(method, entry);
+		}
+		for (const [method, entry] of byMethod) {
+			expect(entry.headers["mcp-protocol-version"], method).toBe(MODERN_PROTOCOL_VERSION);
+			expect(entry.headers["mcp-method"], method).toBe(method);
+			const meta = (entry.message?.params as { _meta?: Record<string, unknown> } | undefined)?._meta;
+			expect(meta?.["io.modelcontextprotocol/protocolVersion"], method).toBe(MODERN_PROTOCOL_VERSION);
+			expect(meta?.["io.modelcontextprotocol/clientInfo"], method).toEqual({
+				name: "http-test",
+				version: "1.0.0",
+			});
+			expect(meta?.["io.modelcontextprotocol/clientCapabilities"], method).toEqual({});
+		}
+		expect(recoveries).toBe(1);
+		expect(byMethod.get("server/discover")?.headers.authorization).toBe("Bearer modern-token");
+		expect(byMethod.get("server/discover")?.headers["mcp-name"]).toBeUndefined();
+		expect(byMethod.get("tools/call")?.headers["mcp-name"]).toBe(
+			`=?base64?${Buffer.from("töol").toString("base64")}?=`,
+		);
+		expect(byMethod.get("prompts/get")?.headers["mcp-name"]).toBe("review");
+		expect(byMethod.get("resources/read")?.headers["mcp-name"]).toBe("docs://guide");
 	});
 
 	it("classifies authentication failures", async () => {

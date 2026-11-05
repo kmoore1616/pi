@@ -25,7 +25,7 @@ const result = await client.callTool("search", { query: "MCP" });
 await client.close();
 ```
 
-For a remote server, use `new StreamableHttpTransport({ url, headers })`. Fetch can be injected for proxying or custom networking.
+For a remote server, use `new StreamableHttpTransport({ url, headers })`. Fetch can be injected for proxying or custom networking. Servers that require the modern stateless protocol use `protocolVersion: "2026-07-28"` in `McpClient` options; the default remains the legacy handshake.
 
 An MCP transport owns framing and I/O. It delivers individual JSON-RPC messages to `McpClient`; the client owns request correlation, initialization, timeouts, cancellation, server requests, and protocol-level helpers.
 
@@ -169,8 +169,9 @@ for (const [name, entry] of Object.entries(file.mcpServers)) {
 
 ## Supported protocol surface
 
-- MCP protocol version `2025-11-25`, accepting servers that negotiate `2025-06-18`, `2025-03-26`, or `2024-11-05`
-- initialization and `notifications/initialized`
+- MCP handshake protocol version `2025-11-25`, accepting servers that negotiate `2025-06-18`, `2025-03-26`, or `2024-11-05`
+- explicitly selected modern protocol version `2026-07-28`, with `server/discover`, per-request metadata, and standard HTTP routing headers
+- legacy initialization and `notifications/initialized`
 - ping
 - paginated `tools/list`
 - `tools/call`, including structured content

@@ -42,4 +42,4 @@ node packages/coding-agent/test/mcp-conformance/run.ts --update-baseline
 - `auth/basic-cimd`: pi uses its Client ID Metadata Document on pi.dev, not the suite's `https://conformance-test.local/client-metadata.json`.
 - `auth/scope-retry-limit`: `pi-client` fails by design; the server never accepts the granted scope.
 
-2026-07-28 is not covered: it is a stateless protocol pi does not implement.
+2026-07-28 is not covered by this pinned conformance suite. Pi's explicitly selected modern path has focused client and HTTP transport tests.

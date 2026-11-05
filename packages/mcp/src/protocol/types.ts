@@ -1,12 +1,13 @@
 import type { BlobResourceContents, ContentAnnotations, TextResourceContents } from "./content.ts";
 import type { JsonRpcId } from "./jsonrpc.ts";
 
+export const MODERN_PROTOCOL_VERSION = "2026-07-28";
+/** The newest handshake-era version, and the default when no version is configured. */
 export const LATEST_PROTOCOL_VERSION = "2025-11-25";
-/**
- * Versions the client accepts from a server. Servers that do not support the requested version answer
- * with their own latest one, so older versions stay accepted for servers built on older SDKs.
- */
-export const SUPPORTED_PROTOCOL_VERSIONS = [LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"] as const;
+/** Versions accepted from an `initialize` result. */
+export const LEGACY_PROTOCOL_VERSIONS = [LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"] as const;
+/** Versions the client can speak when explicitly selected. */
+export const SUPPORTED_PROTOCOL_VERSIONS = [MODERN_PROTOCOL_VERSION, ...LEGACY_PROTOCOL_VERSIONS] as const;
 export type SupportedProtocolVersion = (typeof SUPPORTED_PROTOCOL_VERSIONS)[number];
 
 export interface Implementation {
@@ -47,6 +48,16 @@ export interface InitializeResult {
 	capabilities: ServerCapabilities;
 	serverInfo: Implementation;
 	instructions?: string;
+}
+
+export interface DiscoverResult {
+	resultType: string;
+	supportedVersions: string[];
+	capabilities: ServerCapabilities;
+	instructions?: string;
+	ttlMs: number;
+	cacheScope: "public" | "private";
+	_meta?: Record<string, unknown>;
 }
 
 export interface ProgressNotification {

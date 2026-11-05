@@ -18,18 +18,20 @@ import {
 } from "./protocol/jsonrpc.ts";
 import {
 	type ClientCapabilities,
+	type DiscoverResult,
 	type Implementation,
 	type InitializeResult,
 	LATEST_PROTOCOL_VERSION,
+	LEGACY_PROTOCOL_VERSIONS,
 	type ListResourcesResult,
 	type ListResourceTemplatesResult,
+	MODERN_PROTOCOL_VERSION,
 	type ProgressNotification,
 	type ReadResourceResult,
 	type Resource,
 	type ResourceTemplate,
 	type Root,
 	type ServerCapabilities,
-	SUPPORTED_PROTOCOL_VERSIONS,
 	type SupportedProtocolVersion,
 	type Tool,
 } from "./protocol/types.ts";
@@ -84,6 +86,36 @@ function validateInitializeResult(value: unknown): InitializeResult {
 		throw new McpError(JSON_RPC_ERROR_CODES.invalidRequest, "Invalid MCP initialize result");
 	}
 	return value as unknown as InitializeResult;
+}
+
+function validateDiscoverResult(value: unknown): DiscoverResult {
+	if (
+		!isObject(value) ||
+		value.resultType !== "complete" ||
+		!Array.isArray(value.supportedVersions) ||
+		!value.supportedVersions.every((version) => typeof version === "string") ||
+		!isObject(value.capabilities) ||
+		typeof value.ttlMs !== "number" ||
+		(value.cacheScope !== "public" && value.cacheScope !== "private") ||
+		(value.instructions !== undefined && typeof value.instructions !== "string") ||
+		(value._meta !== undefined && !isObject(value._meta))
+	) {
+		throw new McpError(JSON_RPC_ERROR_CODES.invalidRequest, "Invalid MCP server/discover result");
+	}
+	return value as unknown as DiscoverResult;
+}
+
+function discoveryServerInfo(result: DiscoverResult): Implementation {
+	const value = result._meta?.["io.modelcontextprotocol/serverInfo"];
+	if (
+		isObject(value) &&
+		typeof value.name === "string" &&
+		typeof value.version === "string" &&
+		(value.title === undefined || typeof value.title === "string")
+	) {
+		return value as unknown as Implementation;
+	}
+	return { name: "unknown", version: "unknown" };
 }
 
 function invalid(message: string): McpError {
@@ -214,39 +246,80 @@ export class McpClient {
 
 		try {
 			await transport.start();
-			const capabilities: ClientCapabilities = { ...this.options.capabilities };
-			if (this.options.roots && capabilities.roots === undefined) capabilities.roots = {};
-			const result = validateInitializeResult(
-				await this.requestInternal(
-					"initialize",
-					{
-						protocolVersion: this.options.protocolVersion ?? LATEST_PROTOCOL_VERSION,
-						capabilities,
-						clientInfo: {
-							name: this.options.name,
-							version: this.options.version,
-							...(this.options.title === undefined ? {} : { title: this.options.title }),
-						},
-					},
-					{},
-					true,
-				),
-			);
-			if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)) {
-				throw new Error(`MCP server selected unsupported protocol version ${result.protocolVersion}`);
-			}
-			this.protocolVersionValue = result.protocolVersion;
-			this.serverInfoValue = result.serverInfo;
-			this.serverCapabilitiesValue = result.capabilities;
-			this.instructionsValue = result.instructions;
-			transport.setProtocolVersion?.(result.protocolVersion);
-			await this.notifyInternal("notifications/initialized", undefined, true);
+			const requestedVersion = this.options.protocolVersion ?? LATEST_PROTOCOL_VERSION;
+			const result =
+				requestedVersion === MODERN_PROTOCOL_VERSION
+					? await this.connectModern(transport)
+					: await this.connectLegacy(transport, requestedVersion);
 			this.state = "connected";
 			return result;
 		} catch (error) {
 			await this.close().catch(() => {});
 			throw error;
 		}
+	}
+
+	private async connectLegacy(
+		transport: McpTransport,
+		requestedVersion: SupportedProtocolVersion,
+	): Promise<InitializeResult> {
+		const result = validateInitializeResult(
+			await this.requestInternal(
+				"initialize",
+				{
+					protocolVersion: requestedVersion,
+					capabilities: this.clientCapabilities(),
+					clientInfo: this.clientInfo(),
+				},
+				{},
+				true,
+			),
+		);
+		if (!(LEGACY_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)) {
+			throw new Error(`MCP server selected unsupported protocol version ${result.protocolVersion}`);
+		}
+		this.applyConnectionResult(result);
+		transport.setProtocolVersion?.(result.protocolVersion);
+		await this.notifyInternal("notifications/initialized", undefined, true);
+		return result;
+	}
+
+	private async connectModern(transport: McpTransport): Promise<InitializeResult> {
+		this.protocolVersionValue = MODERN_PROTOCOL_VERSION;
+		transport.setProtocolVersion?.(MODERN_PROTOCOL_VERSION);
+		const discovery = validateDiscoverResult(await this.requestInternal("server/discover", undefined, {}, true));
+		if (!discovery.supportedVersions.includes(MODERN_PROTOCOL_VERSION)) {
+			throw new Error(`MCP server does not support protocol version ${MODERN_PROTOCOL_VERSION}`);
+		}
+		const result: InitializeResult = {
+			protocolVersion: MODERN_PROTOCOL_VERSION,
+			capabilities: discovery.capabilities,
+			serverInfo: discoveryServerInfo(discovery),
+			...(discovery.instructions === undefined ? {} : { instructions: discovery.instructions }),
+		};
+		this.applyConnectionResult(result);
+		return result;
+	}
+
+	private clientCapabilities(): ClientCapabilities {
+		const capabilities: ClientCapabilities = { ...this.options.capabilities };
+		if (this.options.roots && capabilities.roots === undefined) capabilities.roots = {};
+		return capabilities;
+	}
+
+	private clientInfo(): Implementation {
+		return {
+			name: this.options.name,
+			version: this.options.version,
+			...(this.options.title === undefined ? {} : { title: this.options.title }),
+		};
+	}
+
+	private applyConnectionResult(result: InitializeResult): void {
+		this.protocolVersionValue = result.protocolVersion;
+		this.serverInfoValue = result.serverInfo;
+		this.serverCapabilitiesValue = result.capabilities;
+		this.instructionsValue = result.instructions;
 	}
 
 	request<Result = unknown>(
@@ -403,10 +476,24 @@ export class McpClient {
 		if (options.signal?.aborted) throw new McpAbortError();
 		const id = this.nextRequestId++;
 		const progressToken = options.onProgress ? id : undefined;
+		const modern = this.protocolVersionValue === MODERN_PROTOCOL_VERSION;
 		const requestParams =
-			progressToken === undefined
-				? params
-				: { ...params, _meta: { ...(isObject(params?._meta) ? params._meta : {}), progressToken } };
+			modern || progressToken !== undefined
+				? {
+						...params,
+						_meta: {
+							...(isObject(params?._meta) ? params._meta : {}),
+							...(modern
+								? {
+										"io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+										"io.modelcontextprotocol/clientInfo": this.clientInfo(),
+										"io.modelcontextprotocol/clientCapabilities": this.clientCapabilities(),
+									}
+								: {}),
+							...(progressToken === undefined ? {} : { progressToken }),
+						},
+					}
+				: params;
 		const message: JsonRpcRequest = {
 			jsonrpc: "2.0",
 			id,
@@ -420,16 +507,16 @@ export class McpClient {
 				timeoutMs: options.timeoutMs ?? this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
 				timer: undefined,
 				signal: options.signal,
-				// The spec forbids cancelling `initialize`.
+				// Lifecycle negotiation must finish or fail as a whole; do not cancel it with a notification.
 				onAbort: () =>
 					this.cancelPending(
 						id,
 						new McpAbortError(),
-						method !== "initialize",
+						method !== "initialize" && method !== "server/discover",
 						String(options.signal?.reason ?? "Aborted"),
 					),
 				sendController: new AbortController(),
-				cancellable: method !== "initialize",
+				cancellable: method !== "initialize" && method !== "server/discover",
 				onProgress: options.onProgress,
 				progressToken,
 			};

@@ -2,6 +2,7 @@ import type { AuthProvider, McpFetch } from "../auth-provider.ts";
 import {
 	isJsonRpcRequest,
 	isJsonRpcResponse,
+	isObject,
 	JSON_RPC_ERROR_CODES,
 	type JsonRpcId,
 	type JsonRpcMessage,
@@ -10,6 +11,7 @@ import {
 	parseJsonRpcMessage,
 	toError,
 } from "../protocol/jsonrpc.ts";
+import { MODERN_PROTOCOL_VERSION } from "../protocol/types.ts";
 import {
 	DEFAULT_MAX_MESSAGE_BYTES,
 	type McpTransport,
@@ -189,6 +191,27 @@ function contentType(response: Response): string | undefined {
 	return response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
 }
 
+function encodeHeaderValue(value: string): string {
+	if (/^[\x21-\x7E](?:[\x20-\x7E]*[\x21-\x7E])?$/.test(value) && !/^=\?base64\?.*\?=$/.test(value)) {
+		return value;
+	}
+	return `=?base64?${Buffer.from(value, "utf8").toString("base64")}?=`;
+}
+
+function modernRequestHeaders(message: JsonRpcMessage): Record<string, string> {
+	if (!("method" in message)) return {};
+	const headers: Record<string, string> = { "Mcp-Method": message.method };
+	if (!isJsonRpcRequest(message) || !isObject(message.params)) return headers;
+	const source = message.method === "resources/read" ? "uri" : "name";
+	if (
+		(message.method === "tools/call" || message.method === "prompts/get" || message.method === "resources/read") &&
+		typeof message.params[source] === "string"
+	) {
+		headers["Mcp-Name"] = encodeHeaderValue(message.params[source]);
+	}
+	return headers;
+}
+
 /** 401, or 403 with an `insufficient_scope` bearer challenge (step-up authorization). */
 function needsAuthorization(response: Response): boolean {
 	if (response.status === 401) return true;
@@ -287,7 +310,11 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 		const response = await this.authorizedFetch(
 			"POST",
 			{
-				headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+				headers: {
+					accept: "application/json, text/event-stream",
+					"content-type": "application/json",
+					...(this.protocolVersion === MODERN_PROTOCOL_VERSION ? modernRequestHeaders(message) : {}),
+				},
 				body: JSON.stringify(message),
 			},
 			signal,
